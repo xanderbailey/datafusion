@@ -358,7 +358,8 @@ fn compatible_nullabilities(
 }
 
 pub(super) struct NameTracker {
-    seen_names: HashSet<String>,
+    seen_schema_names: HashSet<String>,
+    seen_field_names: HashSet<String>,
 }
 
 pub(super) enum NameTrackerStatus {
@@ -369,25 +370,35 @@ pub(super) enum NameTrackerStatus {
 impl NameTracker {
     pub(super) fn new() -> Self {
         NameTracker {
-            seen_names: HashSet::default(),
+            seen_schema_names: HashSet::default(),
+            seen_field_names: HashSet::default(),
         }
     }
     pub(super) fn get_unique_name(
         &mut self,
-        name: String,
+        schema_name: String,
+        field_name: String,
     ) -> (String, NameTrackerStatus) {
-        match self.seen_names.insert(name.clone()) {
-            true => (name, NameTrackerStatus::NeverSeen),
-            false => {
-                let mut counter = 0;
-                loop {
-                    let candidate_name = format!("{name}__temp__{counter}");
-                    if self.seen_names.insert(candidate_name.clone()) {
-                        return (candidate_name, NameTrackerStatus::SeenBefore);
-                    }
-                    counter += 1;
+        let seen_before = self.seen_schema_names.contains(&schema_name)
+            || self.seen_field_names.contains(&field_name);
+
+        if seen_before {
+            let mut counter = 0;
+            loop {
+                let candidate_name = format!("{schema_name}__temp__{counter}");
+                if !self.seen_schema_names.contains(&candidate_name)
+                    && !self.seen_field_names.contains(&candidate_name)
+                {
+                    self.seen_schema_names.insert(candidate_name.clone());
+                    self.seen_field_names.insert(candidate_name.clone());
+                    return (candidate_name, NameTrackerStatus::SeenBefore);
                 }
+                counter += 1;
             }
+        } else {
+            self.seen_schema_names.insert(schema_name.clone());
+            self.seen_field_names.insert(field_name);
+            (schema_name, NameTrackerStatus::NeverSeen)
         }
     }
 
@@ -395,7 +406,10 @@ impl NameTracker {
         &mut self,
         expr: Expr,
     ) -> datafusion::common::Result<Expr> {
-        match self.get_unique_name(expr.name_for_alias()?) {
+        let name_for_alias = expr.name_for_alias()?;
+        let (_, field_name) = expr.qualified_name();
+
+        match self.get_unique_name(name_for_alias, field_name) {
             (_, NameTrackerStatus::NeverSeen) => Ok(expr),
             (name, NameTrackerStatus::SeenBefore) => Ok(expr.alias(name)),
         }
@@ -469,14 +483,18 @@ pub(crate) fn from_substrait_precision(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::make_renamed_schema;
+    use super::NameTracker;
     use crate::extensions::Extensions;
     use crate::logical_plan::consumer::DefaultSubstraitConsumer;
     use datafusion::arrow::datatypes::{DataType, Field};
-    use datafusion::common::DFSchema;
+    use datafusion::common::{Column, DFSchema};
     use datafusion::error::Result;
     use datafusion::execution::SessionState;
+    use datafusion::logical_expr::Expr;
     use datafusion::prelude::SessionContext;
     use datafusion::sql::TableReference;
+    use datafusion_expr::lit;
+    use datafusion_expr::ScalarValue;
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock};
 
@@ -488,6 +506,65 @@ pub(crate) mod tests {
         let extensions = &TEST_EXTENSIONS;
         let state = &TEST_SESSION_STATE;
         DefaultSubstraitConsumer::new(extensions, state)
+    }
+
+    #[test]
+    fn name_tracker_conflicts_on_field_name() {
+        let mut name_tracker = NameTracker::new();
+
+        let literal_expr = lit(ScalarValue::Utf8(None));
+        let literal_expr = name_tracker
+            .get_uniquely_named_expr(literal_expr)
+            .expect("literal name should be accepted");
+
+        assert!(matches!(literal_expr, Expr::Literal(_, _)));
+
+        let column_expr = Expr::Column(Column::new(
+            Some(TableReference::bare("left")),
+            "UTF8(NULL)",
+        ));
+
+        let column_expr = name_tracker
+            .get_uniquely_named_expr(column_expr)
+            .expect("column should be assigned a unique alias");
+
+        match column_expr {
+            Expr::Alias(alias) => {
+                assert_eq!(alias.name, "left.UTF8(NULL)__temp__0");
+            }
+            _ => panic!("expected column expression to be aliased"),
+        }
+    }
+
+    #[test]
+    fn name_tracker_conflicts_on_schema_name() {
+        let mut name_tracker = NameTracker::new();
+
+        let column_expr = Expr::Column(Column::new(Some(TableReference::bare("B")), "C"));
+        let column_expr = name_tracker
+            .get_uniquely_named_expr(column_expr)
+            .expect("first column should not be aliased");
+
+        assert!(matches!(column_expr, Expr::Column(_)));
+
+        let cast_expr = Expr::Cast(datafusion_expr::expr::Cast::new(
+            Box::new(Expr::Column(Column::new(
+                Some(TableReference::bare("B")),
+                "C",
+            ))),
+            DataType::Utf8,
+        ));
+
+        let cast_expr = name_tracker
+            .get_uniquely_named_expr(cast_expr)
+            .expect("cast should be aliased to avoid duplicate names");
+
+        match cast_expr {
+            Expr::Alias(alias) => {
+                assert_eq!(alias.name, "B.C__temp__0");
+            }
+            _ => panic!("expected cast expression to be aliased"),
+        }
     }
 
     #[tokio::test]
