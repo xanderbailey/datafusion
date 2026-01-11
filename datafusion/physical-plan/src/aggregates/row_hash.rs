@@ -1140,7 +1140,7 @@ impl GroupedHashAggregateStream {
             .with_expressions(&self.spill_state.spill_expr)
             .with_metrics(self.baseline_metrics.clone())
             .with_batch_size(self.batch_size)
-            .with_reservation(self.reservation.new_empty())
+            .with_reservation(self.reservation.take())
             .build()?;
         self.input_done = false;
         self.group_ordering = GroupOrdering::Full(GroupOrderingFull::new());
