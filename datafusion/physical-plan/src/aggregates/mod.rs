@@ -1551,7 +1551,7 @@ mod tests {
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{internal_err, DataFusionError, ScalarValue};
     use datafusion_execution::config::SessionConfig;
-    use datafusion_execution::memory_pool::FairSpillPool;
+    use datafusion_execution::memory_pool::{FairSpillPool, MemoryPool};
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_functions_aggregate::array_agg::array_agg_udaf;
     use datafusion_functions_aggregate::average::avg_udaf;
@@ -3136,6 +3136,112 @@ mod tests {
         run_test_with_spill_pool_if_necessary(2_000, true).await?;
         // test without spill
         run_test_with_spill_pool_if_necessary(20_000, false).await?;
+        Ok(())
+    }
+
+    /// Test for memory accounting bug fix where phantom memory was counted
+    /// after update_merged_stream() was called.
+    ///
+    /// This test verifies that when aggregation spills and transitions to
+    /// streaming merge, the memory reservation is properly transferred without
+    /// leaving phantom memory counted against the pool.
+    #[tokio::test]
+    async fn test_memory_accounting_after_spill() -> Result<()> {
+        fn create_record_batch(
+            schema: &Arc<Schema>,
+            data: (Vec<u32>, Vec<f64>),
+        ) -> Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::clone(schema),
+                vec![
+                    Arc::new(UInt32Array::from(data.0)),
+                    Arc::new(Float64Array::from(data.1)),
+                ],
+            )?)
+        }
+
+        // Create schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::UInt32, false),
+            Field::new("b", DataType::Float64, false),
+        ]));
+
+        // Create data that will cause spilling
+        let mut batches = vec![];
+        for i in 0..20 {
+            let start = i * 100;
+            let group_keys: Vec<u32> = (start..start + 100).collect();
+            let values: Vec<f64> = (start..start + 100).map(|x| x as f64).collect();
+            batches.push(create_record_batch(&schema, (group_keys, values))?);
+        }
+
+        let plan = Arc::new(TestMemoryExec::try_new(
+            &[batches],
+            schema.clone(),
+            None,
+        )?);
+
+        // Create aggregation: GROUP BY a, COUNT(b)
+        let grouping_set = PhysicalGroupBy::new_single(vec![(
+            col("a", &schema)?,
+            "a".to_string(),
+        )]);
+
+        let aggregates = vec![Arc::new(
+            AggregateExprBuilder::new(count_udaf(), vec![col("b", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("COUNT(b)")
+                .build()?,
+        )];
+
+        let single_aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            grouping_set,
+            aggregates,
+            vec![None],
+            plan,
+            Arc::clone(&schema),
+        )?);
+
+        // Create a memory pool with limited size to trigger spilling
+        let pool_size = 4_000;
+        let memory_pool = Arc::new(FairSpillPool::new(pool_size));
+        let batch_size = 10;
+
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(batch_size))
+                .with_runtime(Arc::new(
+                    RuntimeEnvBuilder::new()
+                        .with_memory_pool(Arc::clone(&memory_pool) as _)
+                        .build()?,
+                )),
+        );
+
+        // Execute the aggregation
+        let result = collect(single_aggregate.execute(0, Arc::clone(&task_ctx))?).await?;
+
+        // Verify we got results (exact count doesn't matter, we're testing memory)
+        assert!(!result.is_empty(), "Expected non-empty result");
+
+        // The key assertion: verify that memory was properly released
+        // After execution completes, the memory pool should have minimal reserved memory
+        let reserved = memory_pool.reserved();
+
+        // After all processing is done, reserved memory should be released.
+        // We allow for some small amount of memory that might be held by
+        // completed streams, but it should be much less than the pool size.
+        assert!(
+            reserved < pool_size / 2,
+            "Expected reserved memory to be less than {}, but got {}. \
+             This indicates phantom memory is still being counted.",
+            pool_size / 2,
+            reserved
+        );
+
+        // Verify that spilling actually occurred
+        assert_spill_count_metric(true, single_aggregate);
+
         Ok(())
     }
 }
